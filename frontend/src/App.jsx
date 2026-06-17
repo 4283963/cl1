@@ -1,11 +1,12 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { Routes, Route, NavLink, useNavigate } from 'react-router-dom'
-import { Layout, Menu, Badge, notification } from 'antd'
+import { Layout, Menu, Badge, notification, Button, Result } from 'antd'
 import {
   DashboardOutlined,
   CarOutlined,
   WarningOutlined,
-  BellOutlined
+  BellOutlined,
+  ReloadOutlined
 } from '@ant-design/icons'
 import DeviceList from './pages/DeviceList.jsx'
 import AlertMonitor from './pages/AlertMonitor.jsx'
@@ -14,10 +15,58 @@ import { alertApi } from './services/api.js'
 
 const { Header, Sider, Content } = Layout
 
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props)
+    this.state = { hasError: false, error: null }
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error }
+  }
+
+  componentDidCatch(error, errorInfo) {
+    console.error('ErrorBoundary caught:', error, errorInfo)
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <Result
+          status="error"
+          title="页面渲染异常"
+          subTitle="系统遇到了一个渲染错误，请刷新页面重试。如果问题持续，请联系技术支持。"
+          extra={[
+            <Button
+              key="retry"
+              type="primary"
+              icon={<ReloadOutlined />}
+              onClick={() => {
+                this.setState({ hasError: false, error: null })
+              }}
+            >
+              重试
+            </Button>,
+            <Button
+              key="reload"
+              onClick={() => window.location.reload()}
+            >
+              刷新页面
+            </Button>
+          ]}
+        />
+      )
+    }
+    return this.props.children
+  }
+}
+
 function App() {
   const [unacknowledgedCount, setUnacknowledgedCount] = useState(0)
   const [api, contextHolder] = notification.useNotification()
   const navigate = useNavigate()
+  const lastNotifiedRef = useRef(new Map())
+  const notifThrottleRef = useRef(new Map())
 
   const fetchUnacknowledgedCount = async () => {
     try {
@@ -34,6 +83,34 @@ function App() {
     return () => clearInterval(interval)
   }, [])
 
+  const handleWsAlert = useCallback((alert) => {
+    if (!alert || !alert.deviceId) return
+
+    setUnacknowledgedCount(prev => prev + 1)
+
+    const dedupeKey = `${alert.deviceId}_${alert.alertType}_${alert.temperature}`
+    const now = Date.now()
+    const lastTime = notifThrottleRef.current.get(dedupeKey) || 0
+    if (now - lastTime < 3000) {
+      return
+    }
+    notifThrottleRef.current.set(dedupeKey, now)
+
+    if (lastNotifiedRef.current.size > 50) {
+      const oldest = lastNotifiedRef.current.keys().next().value
+      lastNotifiedRef.current.delete(oldest)
+    }
+
+    api.open({
+      message: '温度告警！',
+      description: alert.message,
+      icon: <WarningOutlined style={{ color: '#ff4d4f' }} />,
+      duration: 0,
+      type: 'error',
+      onClick: () => navigate('/alerts')
+    })
+  }, [api, navigate])
+
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const wsUrl = `${protocol}//${window.location.host}/ws/alerts`
@@ -46,15 +123,7 @@ function App() {
     ws.onmessage = (event) => {
       try {
         const alert = JSON.parse(event.data)
-        setUnacknowledgedCount(prev => prev + 1)
-        api.open({
-          message: '温度告警！',
-          description: alert.message,
-          icon: <WarningOutlined style={{ color: '#ff4d4f' }} />,
-          duration: 0,
-          type: 'error',
-          onClick: () => navigate('/alerts')
-        })
+        handleWsAlert(alert)
       } catch (e) {
         console.error('Failed to parse WS message:', e)
       }
@@ -65,7 +134,7 @@ function App() {
     }
 
     return () => ws.close()
-  }, [api, navigate])
+  }, [handleWsAlert])
 
   const menuItems = [
     {
@@ -126,12 +195,14 @@ function App() {
               minHeight: 280,
               borderRadius: 8
             }}>
-              <Routes>
-                <Route path="/" element={<DeviceList />} />
-                <Route path="/devices" element={<DeviceList />} />
-                <Route path="/alerts" element={<AlertMonitor onAlertChange={fetchUnacknowledgedCount} />} />
-                <Route path="/device/:id/chart" element={<TemperatureChart />} />
-              </Routes>
+              <ErrorBoundary>
+                <Routes>
+                  <Route path="/" element={<DeviceList />} />
+                  <Route path="/devices" element={<DeviceList />} />
+                  <Route path="/alerts" element={<AlertMonitor onAlertChange={fetchUnacknowledgedCount} />} />
+                  <Route path="/device/:id/chart" element={<TemperatureChart />} />
+                </Routes>
+              </ErrorBoundary>
             </Content>
           </Layout>
         </Layout>

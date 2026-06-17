@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   List,
@@ -26,6 +26,25 @@ import {
 import { alertApi } from '../services/api.js'
 import dayjs from 'dayjs'
 
+function getAlertFingerprint(alert) {
+  if (!alert) return ''
+  return `${alert.deviceId || ''}_${alert.alertType || ''}_${alert.temperature || ''}_${alert.createdAt || ''}`
+}
+
+function deduplicateAlerts(alerts) {
+  const seen = new Map()
+  const result = []
+  for (const alert of alerts) {
+    const fp = getAlertFingerprint(alert)
+    const uniqueKey = alert.id != null ? String(alert.id) : fp
+    if (!seen.has(uniqueKey)) {
+      seen.set(uniqueKey, true)
+      result.push({ ...alert, _stableKey: uniqueKey })
+    }
+  }
+  return result
+}
+
 function AlertMonitor({ onAlertChange }) {
   const [alerts, setAlerts] = useState([])
   const [allAlerts, setAllAlerts] = useState([])
@@ -33,6 +52,9 @@ function AlertMonitor({ onAlertChange }) {
   const [showUnacknowledged, setShowUnacknowledged] = useState(true)
   const [popAlert, setPopAlert] = useState(null)
   const navigate = useNavigate()
+  const wsRef = useRef(null)
+  const pendingWsMessagesRef = useRef([])
+  const flushTimerRef = useRef(null)
 
   const fetchAlerts = async () => {
     setLoading(true)
@@ -41,11 +63,11 @@ function AlertMonitor({ onAlertChange }) {
         alertApi.getUnacknowledged(),
         alertApi.getAll()
       ])
-      setAlerts(unackRes.data)
-      setAllAlerts(allRes.data)
+      setAlerts(deduplicateAlerts(unackRes.data))
+      setAllAlerts(deduplicateAlerts(allRes.data))
 
       if (unackRes.data.length > 0 && !popAlert) {
-        setPopAlert(unackRes.data[0])
+        setPopAlert(deduplicateAlerts(unackRes.data)[0])
       }
     } catch (e) {
       console.error('Failed to fetch alerts:', e)
@@ -53,6 +75,38 @@ function AlertMonitor({ onAlertChange }) {
       setLoading(false)
     }
   }
+
+  const flushPendingMessages = useCallback(() => {
+    const messages = pendingWsMessagesRef.current
+    if (messages.length === 0) return
+    pendingWsMessagesRef.current = []
+
+    const latestByFingerprint = new Map()
+    for (const msg of messages) {
+      const fp = getAlertFingerprint(msg)
+      latestByFingerprint.set(fp, msg)
+    }
+
+    const uniqueNewAlerts = Array.from(latestByFingerprint.values())
+    if (uniqueNewAlerts.length === 0) return
+
+    const firstNewAlert = uniqueNewAlerts[0]
+
+    setPopAlert(prev => {
+      if (prev) return prev
+      return { ...firstNewAlert, _stableKey: firstNewAlert.id != null ? String(firstNewAlert.id) : getAlertFingerprint(firstNewAlert) }
+    })
+
+    setAlerts(prev => {
+      const merged = [...uniqueNewAlerts, ...prev]
+      return deduplicateAlerts(merged)
+    })
+
+    setAllAlerts(prev => {
+      const merged = [...uniqueNewAlerts, ...prev]
+      return deduplicateAlerts(merged)
+    })
+  }, [])
 
   useEffect(() => {
     fetchAlerts()
@@ -64,25 +118,50 @@ function AlertMonitor({ onAlertChange }) {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const wsUrl = `${protocol}//${window.location.host}/ws/alerts`
     const ws = new WebSocket(wsUrl)
+    wsRef.current = ws
+
+    ws.onopen = () => {
+      console.log('WebSocket connected')
+    }
 
     ws.onmessage = (event) => {
       try {
         const newAlert = JSON.parse(event.data)
-        setPopAlert(newAlert)
-        setAlerts(prev => [newAlert, ...prev.filter(a => a.id !== newAlert.id)])
-        setAllAlerts(prev => [newAlert, ...prev.filter(a => a.id !== newAlert.id)])
+        if (!newAlert || !newAlert.deviceId) {
+          console.warn('Invalid alert payload, skipping:', newAlert)
+          return
+        }
+
+        pendingWsMessagesRef.current.push(newAlert)
+
+        if (!flushTimerRef.current) {
+          flushTimerRef.current = setTimeout(() => {
+            flushPendingMessages()
+            flushTimerRef.current = null
+          }, 300)
+        }
       } catch (e) {
         console.error('Failed to parse WS message:', e)
       }
     }
 
-    return () => ws.close()
-  }, [])
+    ws.onerror = (e) => {
+      console.error('WebSocket error:', e)
+    }
+
+    return () => {
+      ws.close()
+      if (flushTimerRef.current) {
+        clearTimeout(flushTimerRef.current)
+        flushTimerRef.current = null
+      }
+    }
+  }, [flushPendingMessages])
 
   const handleAcknowledge = async (id) => {
     try {
       await alertApi.acknowledge(id)
-      if (popAlert && popAlert.id === id) {
+      if (popAlert && (popAlert.id === id || popAlert._stableKey === id)) {
         setPopAlert(null)
       }
       await fetchAlerts()
@@ -139,7 +218,7 @@ function AlertMonitor({ onAlertChange }) {
             <Button onClick={() => popAlert && handleViewChart(popAlert.deviceId)}>
               <LineChartOutlined /> 查看温度曲线
             </Button>
-            <Button type="primary" danger onClick={() => popAlert && handleAcknowledge(popAlert.id)}>
+            <Button type="primary" danger onClick={() => popAlert && handleAcknowledge(popAlert.id || popAlert._stableKey)}>
               <CheckCircleOutlined /> 确认告警
             </Button>
           </Space>
@@ -190,7 +269,7 @@ function AlertMonitor({ onAlertChange }) {
                 </Col>
               </Row>
               <div style={{ marginTop: 12, color: '#999', fontSize: 12 }}>
-                告警时间: {dayjs(popAlert.createdAt).format('YYYY-MM-DD HH:mm:ss')}
+                告警时间: {popAlert.createdAt ? dayjs(popAlert.createdAt).format('YYYY-MM-DD HH:mm:ss') : '-'}
               </div>
             </div>
           </div>
@@ -261,7 +340,7 @@ function AlertMonitor({ onAlertChange }) {
             loading={loading}
             renderItem={(item) => (
               <List.Item
-                key={item.id}
+                key={item._stableKey}
                 style={{
                   background: !item.acknowledged ? '#fff1f0' : '#fff',
                   border: `1px solid ${!item.acknowledged ? '#ffa39e' : '#e8e8e8'}`,
@@ -298,11 +377,11 @@ function AlertMonitor({ onAlertChange }) {
                         当前温度: <strong>{item.temperature?.toFixed(2)} ℃</strong>
                       </Tag>
                       <span style={{ color: '#999' }}>
-                        时间: {dayjs(item.createdAt).format('YYYY-MM-DD HH:mm:ss')}
+                        时间: {item.createdAt ? dayjs(item.createdAt).format('YYYY-MM-DD HH:mm:ss') : '-'}
                       </span>
                       {item.acknowledged && (
                         <span style={{ color: '#52c41a' }}>
-                          处理时间: {dayjs(item.acknowledgedAt).format('YYYY-MM-DD HH:mm:ss')}
+                          处理时间: {item.acknowledgedAt ? dayjs(item.acknowledgedAt).format('YYYY-MM-DD HH:mm:ss') : '-'}
                         </span>
                       )}
                     </Space>
@@ -320,7 +399,7 @@ function AlertMonitor({ onAlertChange }) {
                     <Button
                       danger
                       icon={<CheckCircleOutlined />}
-                      onClick={() => handleAcknowledge(item.id)}
+                      onClick={() => handleAcknowledge(item.id || item._stableKey)}
                     >
                       确认告警
                     </Button>

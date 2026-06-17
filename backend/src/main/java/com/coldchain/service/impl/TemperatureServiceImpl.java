@@ -12,8 +12,11 @@ import com.coldchain.service.DeviceService;
 import com.coldchain.service.TemperatureService;
 import com.coldchain.websocket.AlertWebSocketHandler;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -21,6 +24,7 @@ import java.time.ZoneId;
 import java.util.List;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class TemperatureServiceImpl implements TemperatureService {
@@ -47,6 +51,14 @@ public class TemperatureServiceImpl implements TemperatureService {
             readingTime = LocalDateTime.now();
         }
 
+        boolean isDuplicate = temperatureReadingRepository
+                .existsByDeviceAndReadingTimeAndTemperature(device, readingTime, request.getTemperature());
+        if (isDuplicate) {
+            log.debug("Duplicate temperature reading ignored: device={}, time={}, temp={}",
+                    device.getDeviceCode(), readingTime, request.getTemperature());
+            return null;
+        }
+
         TemperatureReading reading = TemperatureReading.builder()
                 .device(device)
                 .temperature(request.getTemperature())
@@ -57,19 +69,39 @@ public class TemperatureServiceImpl implements TemperatureService {
         Alert alert = alertService.checkAndCreateAlert(device, request.getTemperature());
 
         if (alert != null) {
-            AlertDto alertDto = AlertDto.builder()
-                    .id(alert.getId())
-                    .deviceId(device.getId())
-                    .deviceCode(device.getDeviceCode())
-                    .deviceName(device.getDeviceName())
-                    .batchNo(device.getBatchNo())
-                    .alertType(alert.getAlertType())
-                    .message(alert.getMessage())
-                    .temperature(alert.getTemperature())
-                    .acknowledged(alert.getAcknowledged())
-                    .createdAt(alert.getCreatedAt())
-                    .build();
-            webSocketHandler.broadcastAlert(alertDto);
+            final Long alertId = alert.getId();
+            final String deviceCode = device.getDeviceCode();
+            final String deviceName = device.getDeviceName();
+            final String batchNo = device.getBatchNo();
+            final Alert.AlertType alertType = alert.getAlertType();
+            final String message = alert.getMessage();
+            final Double temperature = alert.getTemperature();
+            final Boolean acknowledged = alert.getAcknowledged();
+            final LocalDateTime createdAt = alert.getCreatedAt();
+            final Long deviceId = device.getId();
+
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    try {
+                        AlertDto alertDto = AlertDto.builder()
+                                .id(alertId)
+                                .deviceId(deviceId)
+                                .deviceCode(deviceCode)
+                                .deviceName(deviceName)
+                                .batchNo(batchNo)
+                                .alertType(alertType)
+                                .message(message)
+                                .temperature(temperature)
+                                .acknowledged(acknowledged)
+                                .createdAt(createdAt)
+                                .build();
+                        webSocketHandler.broadcastAlert(alertDto);
+                    } catch (Exception e) {
+                        log.error("Failed to broadcast alert after commit", e);
+                    }
+                }
+            });
         }
 
         return alert;

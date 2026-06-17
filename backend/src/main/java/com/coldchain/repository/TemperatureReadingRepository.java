@@ -19,4 +19,6 @@ public interface TemperatureReadingRepository extends JpaRepository<TemperatureR
     @Query("SELECT t FROM TemperatureReading t WHERE t.device.id = :deviceId AND t.readingTime >= :startTime ORDER BY t.readingTime ASC")
     List<TemperatureReading> findByDeviceIdAndReadingTimeAfter(@Param("deviceId") Long deviceId,
                                                                @Param("startTime") LocalDateTime startTime);
+
+    boolean existsByDeviceAndReadingTimeAndTemperature(Device device, LocalDateTime readingTime, Double temperature);
 }

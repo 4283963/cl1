@@ -6,6 +6,7 @@ import com.coldchain.entity.Device;
 import com.coldchain.repository.AlertRepository;
 import com.coldchain.service.AlertService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -13,8 +14,11 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class AlertServiceImpl implements AlertService {
@@ -23,6 +27,12 @@ public class AlertServiceImpl implements AlertService {
 
     @Value("${app.alert.cooldown-seconds:300}")
     private int alertCooldownSeconds;
+
+    private final ConcurrentHashMap<String, ReentrantLock> deviceAlertLocks = new ConcurrentHashMap<>();
+
+    private String lockKey(Device device, Alert.AlertType alertType) {
+        return device.getId() + ":" + alertType.name();
+    }
 
     @Override
     @Transactional
@@ -50,22 +60,32 @@ public class AlertServiceImpl implements AlertService {
             return null;
         }
 
-        LocalDateTime cutoffTime = LocalDateTime.now().minusSeconds(alertCooldownSeconds);
-        Optional<Alert> recentAlert = alertRepository.findLatestUnacknowledgedByDeviceAndType(device, alertType, cutoffTime);
+        String key = lockKey(device, alertType);
+        ReentrantLock lock = deviceAlertLocks.computeIfAbsent(key, k -> new ReentrantLock());
 
-        if (recentAlert.isPresent()) {
-            return null;
+        lock.lock();
+        try {
+            LocalDateTime cutoffTime = LocalDateTime.now().minusSeconds(alertCooldownSeconds);
+            Optional<Alert> recentAlert = alertRepository.findLatestUnacknowledgedByDeviceAndType(device, alertType, cutoffTime);
+
+            if (recentAlert.isPresent()) {
+                log.debug("Alert cooldown active, skipping: device={}, type={}", device.getDeviceCode(), alertType);
+                return null;
+            }
+
+            Alert alert = Alert.builder()
+                    .device(device)
+                    .alertType(alertType)
+                    .message(message)
+                    .temperature(temperature)
+                    .acknowledged(false)
+                    .build();
+
+            return alertRepository.save(alert);
+        } finally {
+            lock.unlock();
+            deviceAlertLocks.remove(key, lock);
         }
-
-        Alert alert = Alert.builder()
-                .device(device)
-                .alertType(alertType)
-                .message(message)
-                .temperature(temperature)
-                .acknowledged(false)
-                .build();
-
-        return alertRepository.save(alert);
     }
 
     @Override

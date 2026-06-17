@@ -48,11 +48,21 @@ function TemperatureChart() {
         temperatureApi.getLastHour(id)
       ])
       setDevice(deviceRes.data)
-      setReadings(tempRes.data.map(r => ({
-        ...r,
-        timeLabel: dayjs(r.readingTime).format('HH:mm:ss'),
-        fullTime: r.readingTime
-      })))
+      const rawReadings = tempRes.data
+      const seen = new Map()
+      const deduped = []
+      for (const r of rawReadings) {
+        const key = `${r.readingTime}_${r.temperature}`
+        if (!seen.has(key)) {
+          seen.set(key, true)
+          deduped.push({
+            ...r,
+            timeLabel: dayjs(r.readingTime).format('HH:mm:ss'),
+            fullTime: r.readingTime
+          })
+        }
+      }
+      setReadings(deduped)
     } catch (e) {
       console.error('Failed to fetch data:', e)
     } finally {
@@ -182,7 +192,7 @@ function TemperatureChart() {
                         label={{ value: '时间', position: 'insideBottom', offset: -5 }}
                       />
                       <YAxis
-                        domain={['auto', 'auto'}
+                        domain={['auto', 'auto']}
                         tick={{ fontSize: 12 }}
                         label={{ value: '温度(℃)', angle: -90, position: 'insideLeft' }}
                       />
